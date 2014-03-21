@@ -23,22 +23,25 @@
   (resolve action))
 
 (defn- sanitize-action-subspec
-  [subspec]
-  (doto (cond
-         (fn? subspec) subspec
-         (var? subspec) subspec
-         (symbol? subspec) (resolve-action-symbol subspec))
-    (when-not (throw (IllegalArgumentException.
-                      (str "Invalid action-subspec: " subspec))))))
+  [subspec middleware]
+  (cond->
+   (doto (cond
+          (fn? subspec) subspec
+          (var? subspec) subspec
+          (symbol? subspec) (resolve-action-symbol subspec))
+     (when-not (throw (IllegalArgumentException.
+                       (str "Invalid action-subspec: " subspec)))))
+   middleware
+   middleware))
 
 (defn- sanitize-action-spec
   "Convert action-spec to a hash-map request-method->action."
-  [action-spec]
+  [action-spec middleware]
   (if (map? action-spec)
     (reduce-kv #(assoc %1
                   (sanitize-method %2)
-                  (sanitize-action-subspec %3)) {} action-spec)
-    (recur {:ALL action-spec})))
+                  (sanitize-action-subspec %3 middleware)) {} action-spec)
+    (recur {:ALL action-spec} middleware)))
 
 (defn- add-optional-slash-to-route
   [route]
@@ -53,29 +56,41 @@
       add-optional-slash-to-route))
 
 (defn- sanitize-user-specs
-  [specs]
+  [middleware specs] ;; Nil may be specified as middleware and will be
+                     ;; interpreted as identity (but wrapping the
+                     ;; identity-fn is avoided)
   (cond
-   (coll? (first specs)) (not-empty
-                          (mapcat sanitize-user-specs specs))
+   (coll? (first specs))
+   (not-empty
+    (mapcat (partial sanitize-user-specs middleware) specs))
+   
    (seq specs)
-   (let [[path obj1 obj2] specs
+   (let [[obj0 obj1 obj2] specs
          idents (cond (keyword? obj1) #{obj1}
                       (set? obj1) obj1)]
-     [(merge {:path (util/compose-path path)}
-             (if idents
-               {:idents idents
-                :action-spec (sanitize-action-spec obj2)
-                :sub-specs (->> specs
-                                (drop 3)
-                                sanitize-user-specs)}
-               (if (sequential? obj1)
-                 {:sub-specs (->> specs
-                                  rest
-                                  sanitize-user-specs)}
-                 {:action-spec (sanitize-action-spec obj1)
+     (if (string? obj0)
+       [(merge {:path (util/compose-path obj0)}
+               (if idents
+                 {:idents idents
+                  :action-spec (sanitize-action-spec obj2 middleware)
                   :sub-specs (->> specs
-                                  (drop 2)
-                                  sanitize-user-specs)})))])))
+                                  (drop 3)
+                                  (sanitize-user-specs middleware))}
+                 (if (sequential? obj1)
+                   {:sub-specs (->> specs
+                                    rest
+                                    (sanitize-user-specs middleware))}
+                   {:action-spec (sanitize-action-spec obj1 middleware)
+                    :sub-specs (->> specs
+                                    (drop 2)
+                                    (sanitize-user-specs middleware))})))]
+       ;; Wrap the middleware around all sub-specs
+       (->> (rest specs)
+            (sanitize-user-specs
+             ;; middleware is specified like actions
+             (cond->> (sanitize-action-subspec obj0 nil)
+                      middleware
+                      (comp middleware))))))))
 
 (defn- merge-specs-by-path
   "If multiple routes are specified with the same path on one level,
@@ -114,7 +129,7 @@
   ([user-specs] (to-routes "/" user-specs))
   ([root-path user-specs]
      (->> user-specs
-          (sanitize-user-specs)
+          (sanitize-user-specs nil)
           (merge-specs-by-path)
           (compile-specs root-path))))
 
@@ -147,48 +162,8 @@
                            assoc-ident-lookup route)))
           {:routes routes} routes))
 
-;; API
-(defn build-routes
-  "Create routes that can be used with router. 
 
-  A spec must be a vector of either
-
-  [path-spec ident action-spec & specs*] or
-
-  [path-spec action-spec] or
-
-  [path-spec & specs*]
-
-
-  path-spec is a string specifying the parent directory (by default
-  \"/\") of nested specs. It may contain parameterizable sub-paths
-  such as \"/home/profiles/:username/\". These can be resolved
-  under :params in the request when it is passed to an action.
-
-  Idents can used for reverse-routing (url-for). They must be
-  keywords and are optional. Multiple idents for one route may be
-  specified in a set instead of a single keyword. The same idents may
-  be used exclusively in specs that have identical paths and reside on
-  one level.
-
-  action-spec is either:
-
-  - a function that will be invoked for all requests that match the
-    path
-
-  - a namespace qualified symbol that will be resolved before this
-    function returns. require will be invoked on its namespace
-
-  - a var that can be resolved to a function at request time
-
-  - a hash-map mapping request-methods to one of those
-
-
-  Specs will be matched in the order they are provided, regardless of
-  their hierachy level, unless they are on the same level and have the
-  same path in which case their action-specs and idents are merged.
-
-  * multiple specs may be grouped in an extra vector"
+(defn- build-routes
   [& specs]
   (-> specs to-routes make-lookup-tables))
 
@@ -202,15 +177,9 @@
                 not-empty
                 (str "?"))))
 
-(defn url-for
-  "Reconstruct url for route at ident based on parameters in params
-  (optional). opts may specify the following settings in a hash-map
-
-  :no-query When set to logical true, don't append a query-string like
-  ?unmatched-param=its-val for params that could not be used to name
-  sub-dirs in the route."
-  ([routes ident] (url-for routes ident {}))
-  ([routes ident params] (url-for routes ident params {}))
+(defn- url-for*
+  ([routes ident] (url-for* routes ident {}))
+  ([routes ident params] (url-for* routes ident params {}))
   ([routes ident params opts]
      (let [path (get-in routes [:by-ident (keyword ident) :full-path])
            [sub-dirs params-left]
@@ -229,39 +198,114 @@
          (not (:no-query opts))
          (str (build-query-string params-left))))))
 
-(defn router
-  "Create a comporoute request handler. Routes must have been built
-  using build-routes.
+(def ^:private default-method-not-allowed
+  (constantly
+   {:status 405
+    :body "Method not allowed."}))
 
-  A map with resolved parameters is merged onto :params in requests
-  passed to resolved actions, routes can be found under :routes."
-  ([routes]
-     (router
-      routes
-      (constantly {:status 405
-                   :body "Method not allowed."})
-      (constantly {:status 404
-                   :body "Page not found."})))
-  ([routes method-not-allowed page-not-found]
-     (let [{:keys [routes]} routes]
-       (fn [{method :request-method :as request}]
-         (let [[route match]
-               (match-in-routes request routes)
-               {:keys [action-spec]} route
-               action (or (get action-spec (or method
-                                           (sanitize-method :GET)))
-                          (get action-spec (sanitize-method :ALL)))]
-           (if match
-             (if action
-               (-> request
-                   #_(assoc :routes routes)
-                   (assoc ::route-idents (:idents route))
-                   (update-in [:params] merge match)
-                   action)
-               (method-not-allowed request))
-             (page-not-found request)))))))
+(def ^:private default-page-not-found
+  (constantly {:status 404
+                   :body "Page not found."}))
+
+;; API
+(defn url-for
+  "Reconstruct url for route at ident based on parameters in params
+  (optional). opts may specify the following settings in a hash-map
+
+  :no-query When set to logical true, don't append a query-string like
+  ?unmatched-param=its-val for params that could not be used to name
+  sub-dirs in the route."
+  ([req ident]
+     (url-for* (::routes req) ident))
+  ([req ident params]
+     (url-for* (::routes req) ident params))
+  ([req ident params opts]
+     (url-for* (::routes req) ident params opts)))
 
 (defn idents
   "Return idents of the matched route for the ring request map."
   [req]
   (::route-idents req))
+
+(defn router
+  "Create a comporoute router
+
+  A spec must be a vector of either
+
+  [path-spec ident action-spec & specs*] or
+
+  [path-spec action-spec] or
+
+  [path-spec & specs*]
+
+  [middleware & specs*]
+
+
+  path-spec is a string specifying the parent directory (by default
+  \"/\") of nested specs. It may contain parameterizable sub-paths
+  such as \"/home/profiles/:username/\". These can be resolved under
+  :params in the request when it is passed to an action.
+
+  Idents can used for reverse-routing (url-for). They must be keywords
+  and are optional. Multiple idents for one route may be specified in
+  a set instead of a single keyword. The same idents may be used
+  exclusively in specs that have identical paths and reside on one
+  level.
+
+  action-spec is either:
+
+  - a function that will be invoked for all requests that match the
+    path
+
+  - a namespace qualified symbol that will be resolved before this
+    function returns. require will be invoked on its namespace
+
+  - a var that can be resolved to a function at request time
+
+  - a hash-map mapping request-methods to one of those where :all may
+    be used as to provide a fallback handler if no handler is
+    specified for a requests method.
+
+  middleware:
+
+  A function of one argument may be specified (directly, as symbol or
+  var like action-specs) and is invoked with each handler of deeper
+  levels. This has the benefit that dispatched parameters and the
+  route ident are available to the middleware at request time. Nesting
+  multiple middlewares is fully supported.
+
+  (During routing, routes will be matched in the order they are
+  provided, regardless of their hierachy level, unless they are on the
+  same level and have the same path in which case their action-specs
+  and idents are merged)
+
+  * multiple specs may be grouped in an extra vector
+
+
+  A map with resolved parameters is merged onto :params in requests
+  passed to resolved actions, routes can be found under :routes.
+
+  Custom fallback handlers may be added under the kw-args
+  :method-not-allowed and :page-not-found"
+  [specs & {:keys [method-not-allowed page-not-found]}]
+  (let [method-not-allowed (or method-not-allowed
+                               default-method-not-allowed)
+        page-not-found (or page-not-found
+                           default-page-not-found)
+        {:keys [routes] :as compiled} (build-routes specs)]
+    (fn [{method :request-method :as request}]
+      (let [[route match]
+            (match-in-routes request routes)
+            {:keys [action-spec]} route
+            action (or (get action-spec (or method
+                                            (sanitize-method :GET)))
+                       (get action-spec (sanitize-method :ALL)))]
+        (if match
+          (if action
+            (-> request
+                (assoc ::routes compiled
+                       ::route-idents (:idents route))
+                (update-in [:params] merge match)
+                action)
+            (method-not-allowed request))
+          (page-not-found request))))))
