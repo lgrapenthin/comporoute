@@ -254,8 +254,14 @@
            (if match
              (if action
                (-> request
-                   (assoc :routes routes)
+                   #_(assoc :routes routes)
+                   (assoc ::route-idents (:idents route))
                    (update-in [:params] merge match)
                    action)
                (method-not-allowed request))
              (page-not-found request)))))))
+
+(defn idents
+  "Return idents of the matched route for the ring request map."
+  [req]
+  (::route-idents req))
